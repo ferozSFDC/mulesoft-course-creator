@@ -1,0 +1,27 @@
+# Secrets — never commit
+.env
+sf-ca-bundle.pem
+*.pem
+*.key
+
+# Generated output
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.code-workspace
