@@ -1,6 +1,10 @@
 """Content Builder Agent — turns approved research into a structured course."""
 
-from config import make_client, MODEL, thinking_param
+from __future__ import annotations
+
+import anthropic
+
+from config import MODEL, thinking_param, output_config_param
 
 SYSTEM_PROMPT = """You are an expert MuleSoft instructional designer.
 
@@ -27,12 +31,17 @@ and suitable for professional developers.
 """
 
 
-def run(topic: str, research_report: str, critique: str) -> str:
-    """Build a complete course structure from research and judge feedback."""
-    client = make_client()
-    thinking = thinking_param()
+def run(topic: str, research_report: str, critique: str, client: anthropic.Anthropic) -> str:
+    """
+    Build a complete course structure from research and judge feedback.
 
-    create_kwargs = dict(
+    Uses streaming to handle the large output (up to 16k tokens) without
+    blocking or hitting proxy timeouts.
+    """
+    thinking = thinking_param()
+    output_config = output_config_param()
+
+    create_kwargs: dict = dict(
         model=MODEL,
         max_tokens=16000,
         system=SYSTEM_PROMPT,
@@ -55,11 +64,8 @@ def run(topic: str, research_report: str, critique: str) -> str:
     )
     if thinking:
         create_kwargs["thinking"] = thinking
+    if output_config:
+        create_kwargs["output_config"] = output_config
 
-    response = client.messages.create(**create_kwargs)
-
-    for block in response.content:
-        if block.type == "text":
-            return block.text
-
-    return "No course content generated."
+    with client.messages.stream(**create_kwargs) as stream:
+        return stream.get_final_message().content[0].text

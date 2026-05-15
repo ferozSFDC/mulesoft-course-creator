@@ -1,7 +1,12 @@
 """Researcher Agent — finds up-to-date MuleSoft information via web search."""
 
-from config import make_client, MODEL, thinking_param
+from __future__ import annotations
+
+import anthropic
+
+from config import MODEL, thinking_param, output_config_param
 from tools import google_search
+from agents.base import run_with_tools
 
 SYSTEM_PROMPT = """You are a specialist MuleSoft researcher.
 
@@ -35,57 +40,37 @@ Provide a comprehensive research report covering:
 """
 
 
-def run(topic: str) -> str:
+def _execute_tool(tool_name: str, tool_input: dict) -> str:
+    if tool_name == "web_search":
+        return google_search.execute(
+            query=tool_input["query"],
+            num_results=tool_input.get("num_results", 5),
+        )
+    return f"Unknown tool: {tool_name}"
+
+
+def run(topic: str, client: anthropic.Anthropic) -> str:
     """Run the researcher agent and return a structured research report."""
-    client = make_client()
     thinking = thinking_param()
+    output_config = output_config_param()
 
-    messages = [
-        {"role": "user", "content": _USER_PROMPT_TEMPLATE.format(topic=topic)}
-    ]
-
-    create_kwargs = dict(
+    create_kwargs: dict = dict(
         model=MODEL,
         max_tokens=8192,
         system=SYSTEM_PROMPT,
         tools=[google_search.TOOL_DEFINITION],
-        messages=messages,
     )
     if thinking:
         create_kwargs["thinking"] = thinking
+    if output_config:
+        create_kwargs["output_config"] = output_config
 
-    while True:
-        response = client.messages.create(**create_kwargs)
+    messages = [{"role": "user", "content": _USER_PROMPT_TEMPLATE.format(topic=topic)}]
 
-        # Collect any tool calls from this response
-        tool_calls = [b for b in response.content if b.type == "tool_use"]
-
-        if not tool_calls or response.stop_reason == "end_turn":
-            # No more tool calls — extract final text
-            for block in response.content:
-                if block.type == "text":
-                    return block.text
-            return "No research output generated."
-
-        # Execute each tool call and build tool_result blocks
-        assistant_msg = {"role": "assistant", "content": response.content}
-        tool_results = []
-        for tool_call in tool_calls:
-            args = tool_call.input
-            result_text = google_search.execute(
-                query=args["query"],
-                num_results=args.get("num_results", 5),
-            )
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_call.id,
-                    "content": result_text,
-                }
-            )
-
-        messages = messages + [
-            assistant_msg,
-            {"role": "user", "content": tool_results},
-        ]
-        create_kwargs["messages"] = messages
+    return run_with_tools(
+        client=client,
+        create_kwargs=create_kwargs,
+        messages=messages,
+        tool_executor=_execute_tool,
+        fallback="No research output generated.",
+    )

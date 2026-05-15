@@ -7,16 +7,6 @@ from pathlib import Path
 import httpx
 import anthropic
 
-# ── Authentication ─────────────────────────────────────────────────────────────
-_AUTH_TOKEN = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
-_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
-
-if not _AUTH_TOKEN:
-    raise EnvironmentError(
-        "Set ANTHROPIC_AUTH_TOKEN (Salesforce internal token) "
-        "or ANTHROPIC_API_KEY before running."
-    )
-
 # ── Model ─────────────────────────────────────────────────────────────────────
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
 
@@ -66,16 +56,67 @@ class _BedrockProxyTransport(httpx.BaseTransport):
         self._inner.close()
 
 
+def validate_environment() -> None:
+    """
+    Validate all required environment variables at startup.
+    Raises EnvironmentError listing every missing variable so the user
+    can fix them all in one go rather than discovering them one by one.
+    """
+    missing = []
+
+    if not (os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")):
+        missing.append(
+            "ANTHROPIC_AUTH_TOKEN (Salesforce internal token) or ANTHROPIC_API_KEY"
+        )
+
+    if not os.environ.get("TAVILY_API_KEY"):
+        missing.append("TAVILY_API_KEY (required for web search in the Researcher agent)")
+
+    if missing:
+        raise EnvironmentError(
+            "Missing required environment variables:\n"
+            + "\n".join(f"  - {m}" for m in missing)
+            + "\n\nSee .env.example for the full list of required variables."
+        )
+
+
 def make_client() -> anthropic.Anthropic:
-    """Return a configured Anthropic client pointing at the Salesforce proxy."""
-    if _BASE_URL:
-        transport = _BedrockProxyTransport(_BASE_URL, _AUTH_TOKEN, _SSL_VERIFY)
+    """
+    Return a configured Anthropic client.
+
+    Validates credentials on first call. The caller is responsible for
+    closing the underlying httpx.Client when done (use as a context manager
+    or call client.close() explicitly).
+    """
+    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+
+    if not auth_token:
+        raise EnvironmentError(
+            "Set ANTHROPIC_AUTH_TOKEN (Salesforce internal token) "
+            "or ANTHROPIC_API_KEY before running."
+        )
+
+    if base_url:
+        transport = _BedrockProxyTransport(base_url, auth_token, _SSL_VERIFY)
         http_client = httpx.Client(transport=transport)
-        # base_url must be set to something; the transport rewrites the final URL anyway.
-        return anthropic.Anthropic(api_key=_AUTH_TOKEN, base_url=_BASE_URL, http_client=http_client)
-    return anthropic.Anthropic(api_key=_AUTH_TOKEN)
+        return anthropic.Anthropic(api_key=auth_token, base_url=base_url, http_client=http_client)
+    return anthropic.Anthropic(api_key=auth_token)
 
 
 def thinking_param() -> dict | None:
-    """Return the thinking parameter dict, or None when thinking is disabled."""
-    return {"type": "adaptive"} if USE_THINKING else None
+    """
+    Return the thinking + effort parameters for Opus 4.7, or None when
+    thinking is disabled. effort="xhigh" is the recommended default for
+    intelligence-sensitive work on Opus 4.7.
+    """
+    if not USE_THINKING:
+        return None
+    return {"type": "adaptive"}
+
+
+def output_config_param() -> dict | None:
+    """Return output_config with effort=xhigh when thinking is enabled."""
+    if not USE_THINKING:
+        return None
+    return {"effort": "xhigh"}

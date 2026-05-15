@@ -1,11 +1,11 @@
 """
-Orchestrator Agent — manages the Course Creation System workflow.
+Orchestrator — manages the Course Creation System workflow.
 
 Workflow:
   1. Researcher gathers topic information via web search.
   2. Judge critiques the research for quality and completeness.
   3. If REJECTED or NEEDS_REVISION, Researcher refines (up to MAX_RESEARCH_RETRIES).
-  4. Content Builder produces the final structured course.
+  4. Content Builder produces the final structured course via streaming.
   5. Results are saved to the output/ directory.
 """
 
@@ -13,8 +13,9 @@ import json
 import datetime
 from pathlib import Path
 
-from config import make_client, MODEL, thinking_param
+from config import make_client, validate_environment, MODEL, thinking_param, output_config_param
 from agents import researcher, judge, content_builder
+from agents.base import run_with_tools
 from tools import google_search
 
 MAX_RESEARCH_RETRIES = 2
@@ -43,10 +44,35 @@ def _print_step(step: str, detail: str = "") -> None:
     print(f"{'='*60}")
 
 
-def _refine_research(topic: str, original_research: str, critique: str) -> str:
+def _execute_search_tool(tool_name: str, tool_input: dict) -> str:
+    if tool_name == "web_search":
+        return google_search.execute(
+            query=tool_input["query"],
+            num_results=tool_input.get("num_results", 5),
+        )
+    return f"Unknown tool: {tool_name}"
+
+
+def _refine_research(
+    topic: str,
+    original_research: str,
+    critique: str,
+    client,
+) -> str:
     """Ask the researcher to improve its report based on judge feedback."""
-    client = make_client()
     thinking = thinking_param()
+    output_config = output_config_param()
+
+    create_kwargs: dict = dict(
+        model=MODEL,
+        max_tokens=8192,
+        system=_REFINE_SYSTEM,
+        tools=[google_search.TOOL_DEFINITION],
+    )
+    if thinking:
+        create_kwargs["thinking"] = thinking
+    if output_config:
+        create_kwargs["output_config"] = output_config
 
     messages = [
         {
@@ -64,48 +90,13 @@ def _refine_research(topic: str, original_research: str, critique: str) -> str:
         }
     ]
 
-    create_kwargs = dict(
-        model=MODEL,
-        max_tokens=8192,
-        system=_REFINE_SYSTEM,
-        tools=[google_search.TOOL_DEFINITION],
+    return run_with_tools(
+        client=client,
+        create_kwargs=create_kwargs,
         messages=messages,
+        tool_executor=_execute_search_tool,
+        fallback=original_research,
     )
-    if thinking:
-        create_kwargs["thinking"] = thinking
-
-    while True:
-        response = client.messages.create(**create_kwargs)
-
-        tool_calls = [b for b in response.content if b.type == "tool_use"]
-
-        if not tool_calls or response.stop_reason == "end_turn":
-            for block in response.content:
-                if block.type == "text":
-                    return block.text
-            return original_research
-
-        assistant_msg = {"role": "assistant", "content": response.content}
-        tool_results = []
-        for tool_call in tool_calls:
-            args = tool_call.input
-            result_text = google_search.execute(
-                query=args["query"],
-                num_results=args.get("num_results", 5),
-            )
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_call.id,
-                    "content": result_text,
-                }
-            )
-
-        messages = messages + [
-            assistant_msg,
-            {"role": "user", "content": tool_results},
-        ]
-        create_kwargs["messages"] = messages
 
 
 def run(topic: str) -> dict:
@@ -114,51 +105,58 @@ def run(topic: str) -> dict:
 
     Returns a dict with keys: topic, research, critique, course, verdict, run_id.
     """
+    validate_environment()
+
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"\n🎓 MuleSoft Course Creation System")
     print(f"   Topic  : {topic}")
     print(f"   Run ID : {run_id}")
 
-    # ── Step 1: Research ──────────────────────────────────────────────────────
-    _print_step("Step 1/3 — Researcher Agent", "Gathering information via web search…")
-    research = researcher.run(topic)
-    research_path = _save_artifact("research", research, run_id)
-    print(f"  ✔ Research saved → {research_path.name}")
+    client = make_client()
+    try:
+        # ── Step 1: Research ──────────────────────────────────────────────────
+        _print_step("Step 1/3 — Researcher Agent", "Gathering information via web search…")
+        research = researcher.run(topic, client)
+        research_path = _save_artifact("research", research, run_id)
+        print(f"  ✔ Research saved → {research_path.name}")
 
-    # ── Step 2: Judge (with retry loop) ──────────────────────────────────────
-    verdict = "NEEDS_REVISION"
-    critique = ""
-    attempt = 0
+        # ── Step 2: Judge (with retry loop) ──────────────────────────────────
+        verdict = "NEEDS_REVISION"
+        critique = ""
+        attempt = 0
 
-    while verdict != "APPROVED" and attempt <= MAX_RESEARCH_RETRIES:
-        attempt += 1
-        label = "Step 2/3" if attempt == 1 else f"Step 2/3 (retry {attempt-1})"
-        _print_step(f"{label} — Judge Agent", "Evaluating research quality…")
+        while verdict != "APPROVED" and attempt <= MAX_RESEARCH_RETRIES:
+            attempt += 1
+            label = "Step 2/3" if attempt == 1 else f"Step 2/3 (retry {attempt - 1})"
+            _print_step(f"{label} — Judge Agent", "Evaluating research quality…")
 
-        critique = judge.run(topic, research)
-        verdict = judge.extract_verdict(critique)
-        critique_path = _save_artifact(f"critique_attempt{attempt}", critique, run_id)
-        print(f"  Verdict : {verdict}")
-        print(f"  ✔ Critique saved → {critique_path.name}")
+            critique = judge.run(topic, research, client)
+            verdict = judge.extract_verdict(critique)
+            critique_path = _save_artifact(f"critique_attempt{attempt}", critique, run_id)
+            print(f"  Verdict : {verdict}")
+            print(f"  ✔ Critique saved → {critique_path.name}")
 
-        if verdict in ("REJECTED", "NEEDS_REVISION") and attempt <= MAX_RESEARCH_RETRIES:
-            _print_step(
-                f"  ↻ Researcher refinement {attempt}/{MAX_RESEARCH_RETRIES}",
-                "Incorporating judge feedback…",
-            )
-            research = _refine_research(topic, research, critique)
-            research_path = _save_artifact(f"research_refined{attempt}", research, run_id)
-            print(f"  ✔ Refined research saved → {research_path.name}")
+            if verdict in ("REJECTED", "NEEDS_REVISION") and attempt <= MAX_RESEARCH_RETRIES:
+                _print_step(
+                    f"  ↻ Researcher refinement {attempt}/{MAX_RESEARCH_RETRIES}",
+                    "Incorporating judge feedback…",
+                )
+                research = _refine_research(topic, research, critique, client)
+                research_path = _save_artifact(f"research_refined{attempt}", research, run_id)
+                print(f"  ✔ Refined research saved → {research_path.name}")
 
-    if verdict == "REJECTED":
-        print(f"\n⚠️  Research could not reach approval after {MAX_RESEARCH_RETRIES} retries.")
-        print("   Proceeding with best available research…")
+        if verdict == "REJECTED":
+            print(f"\n⚠️  Research could not reach approval after {MAX_RESEARCH_RETRIES} retries.")
+            print("   Proceeding with best available research…")
 
-    # ── Step 3: Content Builder ───────────────────────────────────────────────
-    _print_step("Step 3/3 — Content Builder Agent", "Generating structured course…")
-    course = content_builder.run(topic, research, critique)
-    course_path = _save_artifact("course", course, run_id)
-    print(f"  ✔ Course saved → {course_path.name}")
+        # ── Step 3: Content Builder ───────────────────────────────────────────
+        _print_step("Step 3/3 — Content Builder Agent", "Generating structured course…")
+        course = content_builder.run(topic, research, critique, client)
+        course_path = _save_artifact("course", course, run_id)
+        print(f"  ✔ Course saved → {course_path.name}")
+
+    finally:
+        client.close()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     result = {

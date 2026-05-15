@@ -1,7 +1,8 @@
-"""Client-side Tavily search tool for use with Claude tool_use."""
+"""Tavily web search tool for use with Claude tool_use."""
 
 import os
-import requests
+
+import httpx
 
 _API_KEY = os.environ.get("TAVILY_API_KEY")
 
@@ -37,7 +38,7 @@ def execute(query: str, num_results: int = 5) -> str:
 
     num_results = max(1, min(10, num_results))
     try:
-        resp = requests.post(
+        resp = httpx.post(
             "https://api.tavily.com/search",
             json={
                 "api_key": _API_KEY,
@@ -45,11 +46,11 @@ def execute(query: str, num_results: int = 5) -> str:
                 "max_results": num_results,
                 "search_depth": "basic",
             },
-            timeout=15,
+            timeout=15.0,
         )
         resp.raise_for_status()
         data = resp.json()
-    except requests.RequestException as exc:
+    except httpx.HTTPError as exc:
         return f"Search request failed: {exc}"
 
     results = data.get("results", [])
